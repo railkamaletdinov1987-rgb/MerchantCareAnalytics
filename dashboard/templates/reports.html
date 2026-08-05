@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Отчёт — Merchant Care</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            padding: 24px;
+        }
+        a { color: #60a5fa; text-decoration: none; }
+        h1 { font-size: 22px; margin-bottom: 4px; }
+        .subtitle { color: #94a3b8; font-size: 13px; margin-bottom: 20px; }
+        .nav { margin-bottom: 16px; font-size: 13px; }
+        .toolbar {
+            display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+            background: #1e293b; padding: 14px 16px; border-radius: 10px; margin-bottom: 24px;
+        }
+        .toolbar a, .toolbar button, .toolbar .link-btn {
+            border: none; border-radius: 8px; padding: 8px 14px; font-size: 13px;
+            font-weight: 600; cursor: pointer; text-decoration: none; display: inline-block;
+        }
+        .btn-period { background: #334155; color: #e2e8f0; }
+        .btn-period.active { background: #3b82f6; color: #fff; }
+        .btn-excel { background: #22c55e; color: #000; }
+        .btn-print { background: #f59e0b; color: #000; }
+        input[type="text"] {
+            background: #0f172a; border: 1px solid #334155; color: #e2e8f0;
+            padding: 6px 10px; border-radius: 6px; font-size: 13px; width: 110px;
+        }
+        .kpi-row {
+            display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 24px;
+        }
+        .kpi-card {
+            background: #1e293b; border-radius: 12px; padding: 16px; text-align: center;
+        }
+        .kpi-card .label { font-size: 12px; color: #94a3b8; margin-bottom: 6px; }
+        .kpi-card .value { font-size: 22px; font-weight: 700; }
+        .ok { color: #22c55e; }
+        .section {
+            background: #1e293b; border-radius: 12px; padding: 20px; margin-bottom: 20px;
+        }
+        .section h2 { font-size: 16px; margin-bottom: 14px; color: #94a3b8; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th { text-align: left; padding: 8px 10px; color: #94a3b8; border-bottom: 1px solid #334155; }
+        td { padding: 8px 10px; border-bottom: 1px solid #1e293b; }
+        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .summary-box {
+            background: #1e293b; border-radius: 12px; padding: 20px; margin-bottom: 24px;
+            line-height: 1.7; font-size: 14px;
+        }
+        .summary-box b { color: #fff; }
+        @media print {
+            body { background: #fff; color: #000; }
+            .toolbar, .nav, .no-print { display: none !important; }
+            .kpi-card, .section, .summary-box { background: #f5f5f5; border: 1px solid #ddd; }
+            th, .section h2, .subtitle { color: #333; }
+        }
+        @media (max-width: 900px) {
+            .kpi-row, .grid-2 { grid-template-columns: 1fr 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="nav no-print"><a href="/">← Dashboard</a></div>
+
+    <h1>Merchant Care — отчёт</h1>
+    <div class="subtitle">Период: {{ label }} · Сформирован: {{ now }}</div>
+
+    <div class="toolbar no-print">
+        <a class="btn-period {% if period == 'week' %}active{% endif %}" href="/reports?period=week">Эта неделя</a>
+        <a class="btn-period {% if period == 'month' %}active{% endif %}" href="/reports?period=month">Этот месяц</a>
+
+        <form method="get" action="/reports" style="display:flex; gap:8px; align-items:center;">
+            <input type="hidden" name="period" value="custom">
+            <input type="text" name="date_from" value="{{ date_from_input }}" placeholder="с">
+            <input type="text" name="date_to" value="{{ date_to_input }}" placeholder="по">
+            <button class="btn-period" type="submit">Период</button>
+        </form>
+
+        <a class="btn-excel" href="/reports/excel?period={{ period }}&date_from={{ date_from_input }}&date_to={{ date_to_input }}">
+            Скачать Excel
+        </a>
+        <button class="btn-print" type="button" onclick="window.print()">Печать / PDF</button>
+    </div>
+
+    <div class="summary-box">
+        <div>Всего сообщений (нагрузка): <b>{{ messages_total }}</b></div>
+        <div>Cases: <b>{{ total_cases }}</b> (закрыто {{ closed_cases }}, открыто {{ open_cases }})</div>
+        <div>Средний ответ: <b>{{ avg_response }} мин</b></div>
+        <div>SLA: <b class="{% if sla_percent >= 95 %}ok{% endif %}">{{ sla_percent }}%</b></div>
+        <div>Лучший сотрудник: <b>{{ best_employee }}</b></div>
+        <div>Самый загруженный партнёр: <b>{{ top_load }}</b></div>
+    </div>
+
+    <div class="kpi-row">
+        <div class="kpi-card">
+            <div class="label">💬 Сообщений</div>
+            <div class="value">{{ messages_total }}</div>
+        </div>
+        <div class="kpi-card">
+            <div class="label">📩 Cases</div>
+            <div class="value">{{ total_cases }}</div>
+        </div>
+        <div class="kpi-card">
+            <div class="label">⏱ Ср. ответ</div>
+            <div class="value">{{ avg_response }} мин</div>
+        </div>
+        <div class="kpi-card">
+            <div class="label">🚨 SLA</div>
+            <div class="value {% if sla_percent >= 95 %}ok{% endif %}">{{ sla_percent }}%</div>
+        </div>
+    </div>
+
+    <div class="grid-2">
+        <div class="section">
+            <h2>KPI сотрудников</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Сотрудник</th>
+                        <th>Cases</th>
+                        <th>Ср. ответ</th>
+                        <th>SLA</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for emp in emp_kpi %}
+                    <tr>
+                        <td>{{ emp.name }}</td>
+                        <td>{{ emp.count }}</td>
+                        <td>{{ emp.avg_response }} мин</td>
+                        <td>{{ emp.sla }}%</td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="4">Нет данных за период</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+
+        <div class="section">
+            <h2>ТОП мерчантов</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Merchant</th>
+                        <th>Сообщений</th>
+                        <th>Cases</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for m in top_merchants %}
+                    <tr>
+                        <td>{{ m.name }}</td>
+                        <td>{{ m.messages }}</td>
+                        <td>{{ m.cases }}</td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="3">Нет данных за период</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</body>
+</html>

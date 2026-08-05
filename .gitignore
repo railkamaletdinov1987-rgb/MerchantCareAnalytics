@@ -1,0 +1,23 @@
+# Секреты — НЕ в GitHub
+.env
+config/credentials.json
+
+# Telegram-сессия
+data/
+*.session
+*.session-journal
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Логи и мусор
+logs/
+*.log
+groups_list.txt
+.DS_Store
+Thumbs.db
+desktop.ini
