@@ -67,6 +67,7 @@
         }
         .kpi-card .label { font-size: 12px; color: #94a3b8; margin-bottom: 6px; }
         .kpi-card .value { font-size: 24px; font-weight: 700; }
+        .kpi-card .value.small { font-size: 18px; }
         .ok { color: #22c55e; }
         .warn { color: #f59e0b; }
         .bad { color: #ef4444; }
@@ -161,8 +162,8 @@
             <div class="value">{{ messages_today }}</div>
         </div>
         <div class="kpi-card">
-            <div class="label">📩 Cases (трек/тел)</div>
-            <div class="value">{{ total_today }}</div>
+            <div class="label">📩 Cases мерчанты / внутр.</div>
+            <div class="value small">{{ merchant_cases_today }} / {{ internal_cases_today }}</div>
         </div>
         <div class="kpi-card">
             <div class="label">⏱ Средний ответ</div>
@@ -175,7 +176,7 @@
             </div>
         </div>
         <div class="kpi-card">
-            <div class="label">📂 Открыто</div>
+            <div class="label">📂 Открыто всего</div>
             <div class="value {% if open_count > 0 %}warn{% else %}ok{% endif %}">{{ open_count }}</div>
         </div>
         <div class="kpi-card">
@@ -191,9 +192,10 @@
                 <thead>
                     <tr>
                         <th>Сотрудник</th>
-                        <th>Cases</th>
+                        <th>Cases (SLA)</th>
                         <th>Ср. ответ</th>
                         <th>SLA</th>
+                        <th>Помог (просроч.)</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -203,9 +205,10 @@
                         <td>{{ emp.count }}</td>
                         <td>{{ emp.avg_response }} мин</td>
                         <td>{{ emp.sla }}%</td>
+                        <td>{{ emp.helped_missed }}</td>
                     </tr>
                     {% else %}
-                    <tr><td colspan="4">Нет данных</td></tr>
+                    <tr><td colspan="5">Нет данных</td></tr>
                     {% endfor %}
                 </tbody>
             </table>
@@ -243,12 +246,13 @@
 
     <div class="grid-2">
         <div class="section">
-            <h2>Открытые Cases</h2>
+            <h2>Открытые Cases (мерчанты)</h2>
             <table>
                 <thead>
                     <tr>
                         <th>Время</th>
                         <th>Merchant</th>
+                        <th>Группа</th>
                         <th>Track</th>
                     </tr>
                 </thead>
@@ -257,54 +261,85 @@
                     <tr>
                         <td>{{ case.get("Время", "") }}</td>
                         <td>{{ case.get("Merchant", "") }}</td>
+                        <td>{{ case.get("Group", "") }}</td>
                         <td>{{ case.get("Track", "") }}</td>
                     </tr>
                     {% else %}
-                    <tr><td colspan="3">Нет открытых</td></tr>
+                    <tr><td colspan="4">Нет открытых</td></tr>
                     {% endfor %}
                 </tbody>
             </table>
         </div>
 
         <div class="section">
-            <h2>Последние Cases</h2>
+            <h2>Внутренние · сегодня {{ internal_cases_today }} · открыто {{ internal_open_count }}</h2>
             <table>
                 <thead>
                     <tr>
                         <th>Время</th>
                         <th>Merchant</th>
+                        <th>Группа</th>
                         <th>Track</th>
-                        <th>Сотрудник</th>
-                        <th>Статус</th>
-                        <th>SLA</th>
                     </tr>
                 </thead>
                 <tbody>
-                    {% for case in recent_cases %}
+                    {% for case in open_cases_internal %}
                     <tr>
                         <td>{{ case.get("Время", "") }}</td>
                         <td>{{ case.get("Merchant", "") }}</td>
+                        <td>{{ case.get("Group", "") }}</td>
                         <td>{{ case.get("Track", "") }}</td>
-                        <td>{{ case.get("Employee", "") }}</td>
-                        <td>
-                            {% if case.get("Status") == "Open" %}
-                            <span class="badge badge-open">Open</span>
-                            {% else %}
-                            <span class="badge badge-closed">Closed</span>
-                            {% endif %}
-                        </td>
-                        <td>
-                            {% if case.get("SLA") == "OK" %}
-                            <span class="badge badge-ok">OK</span>
-                            {% elif case.get("SLA") == "Missed" %}
-                            <span class="badge badge-missed">Missed</span>
-                            {% endif %}
-                        </td>
                     </tr>
+                    {% else %}
+                    <tr><td colspan="4">Нет открытых внутренних</td></tr>
                     {% endfor %}
                 </tbody>
             </table>
         </div>
+    </div>
+
+    <div class="section">
+        <h2>Последние Cases</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Время</th>
+                    <th>Merchant</th>
+                    <th>Группа</th>
+                    <th>Track</th>
+                    <th>Закрыл</th>
+                    <th>SLA →</th>
+                    <th>Статус</th>
+                    <th>SLA</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for case in recent_cases %}
+                <tr>
+                    <td>{{ case.get("Время", "") }}</td>
+                    <td>{{ case.get("Merchant", "") }}</td>
+                    <td>{{ case.get("Group", "") }}</td>
+                    <td>{{ case.get("Track", "") }}</td>
+                    <td>{{ case.get("Employee", "") }}</td>
+                    <td>{{ case.get("SLA_Owner", "") or "—" }}</td>
+                    <td>
+                        {% if case.get("Status") == "Open" %}
+                        <span class="badge badge-open">Open</span>
+                        {% else %}
+                        <span class="badge badge-closed">Closed</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if case.get("SLA") == "OK" %}
+                        <span class="badge badge-ok">OK</span>
+                        {% elif case.get("SLA") == "Missed" %}
+                        <span class="badge badge-missed">Missed</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
     </div>
 </body>
 </html>

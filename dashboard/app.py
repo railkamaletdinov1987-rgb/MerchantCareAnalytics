@@ -20,9 +20,14 @@ app = FastAPI(title="Merchant Care Analytics")
 templates = Jinja2Templates(directory="dashboard/templates")
 
 TZ = ZoneInfo("Asia/Tashkent")
-
-# Простые сессии в памяти: token → "view" | "admin"
 _sessions: dict[str, str] = {}
+
+
+def _is_internal_merchant(name: str) -> bool:
+    n = (name or "").strip().lower()
+    if not n:
+        return False
+    return n == "internal" or n.startswith("internal:") or n.startswith("internal ")
 
 
 def _auth_enabled() -> bool:
@@ -30,10 +35,8 @@ def _auth_enabled() -> bool:
 
 
 def _get_role(request: Request) -> str | None:
-    """None = не авторизован, view / admin"""
     if not _auth_enabled():
-        return "admin"  # без пароля — полный доступ (как раньше)
-
+        return "admin"
     token = request.cookies.get("mca_session")
     if not token:
         return None
@@ -86,6 +89,13 @@ def get_period_bounds(period: str, date_from: str | None = None, date_to: str | 
     return start, end, label
 
 
+def _sla_owner_of(case: dict) -> str:
+    owner = str(case.get("SLA_Owner", "")).strip()
+    if owner:
+        return owner
+    return str(case.get("Employee", "")).strip()
+
+
 def build_report(start, end, label: str):
     sheets.connect()
     cases = sheets.get_all_cases()
@@ -103,10 +113,13 @@ def build_report(start, end, label: str):
         "response_times": [],
         "sla_ok": 0,
         "sla_total": 0,
+        "helped_missed": 0,
+        "closed_total": 0,
     })
     merchant_cases = defaultdict(int)
     merchant_messages = defaultdict(int)
     messages_total = 0
+    hours = defaultdict(int)
 
     for case in cases:
         case_date = str(case.get("Дата", "")).strip()
@@ -114,7 +127,8 @@ def build_report(start, end, label: str):
             continue
 
         status = str(case.get("Status", "")).strip()
-        employee = str(case.get("Employee", "")).strip()
+        closed_by = str(case.get("Employee", "")).strip()
+        sla_owner = _sla_owner_of(case)
         response_time = case.get("Response Time", "")
         sla = str(case.get("SLA", "")).strip()
         merchant = str(case.get("Merchant", "")).strip()
@@ -124,10 +138,10 @@ def build_report(start, end, label: str):
             closed_cases += 1
         if status == "Open":
             open_cases += 1
-        if merchant:
+        if merchant and not _is_internal_merchant(merchant):
             merchant_cases[merchant] += 1
 
-        if response_time not in ("", None):
+        if status == "Closed" and response_time not in ("", None):
             try:
                 rt = int(float(response_time))
                 response_times.append(rt)
@@ -137,17 +151,22 @@ def build_report(start, end, label: str):
             except Exception:
                 pass
 
-        if employee:
-            employee_stats[employee]["count"] += 1
+        if status == "Closed" and sla_owner:
+            employee_stats[sla_owner]["count"] += 1
             if response_time not in ("", None):
                 try:
                     rt = int(float(response_time))
-                    employee_stats[employee]["response_times"].append(rt)
-                    employee_stats[employee]["sla_total"] += 1
+                    employee_stats[sla_owner]["response_times"].append(rt)
+                    employee_stats[sla_owner]["sla_total"] += 1
                     if sla == "OK":
-                        employee_stats[employee]["sla_ok"] += 1
+                        employee_stats[sla_owner]["sla_ok"] += 1
                 except Exception:
                     pass
+
+        if status == "Closed" and closed_by:
+            employee_stats[closed_by]["closed_total"] += 1
+            if sla_owner and closed_by != sla_owner and sla == "Missed":
+                employee_stats[closed_by]["helped_missed"] += 1
 
     for msg in messages:
         msg_date = str(msg.get("Дата", "")).strip()
@@ -155,8 +174,14 @@ def build_report(start, end, label: str):
             continue
         messages_total += 1
         merchant = str(msg.get("Merchant", "")).strip()
-        if merchant:
+        if merchant and not _is_internal_merchant(merchant):
             merchant_messages[merchant] += 1
+        msg_time = str(msg.get("Время", "")).strip()
+        try:
+            hour = int(msg_time.split(":")[0])
+            hours[hour] += 1
+        except Exception:
+            pass
 
     avg_response = round(sum(response_times) / len(response_times), 1) if response_times else 0
     sla_percent = round(sla_ok / sla_total * 100, 1) if sla_total else 0
@@ -174,6 +199,8 @@ def build_report(start, end, label: str):
             "count": stats["count"],
             "avg_response": avg,
             "sla": sla_p,
+            "helped_missed": stats["helped_missed"],
+            "closed_total": stats["closed_total"],
         })
     emp_kpi.sort(key=lambda x: x["count"], reverse=True)
 
@@ -184,12 +211,24 @@ def build_report(start, end, label: str):
 
     top_merchants = sorted(
         [{"name": k, "messages": merchant_messages.get(k, 0), "cases": merchant_cases.get(k, 0)}
-         for k in set(list(merchant_messages.keys()) + list(merchant_cases.keys()))],
+         for k in set(list(merchant_messages.keys()) + list(merchant_cases.keys()))
+         if not _is_internal_merchant(k)],
         key=lambda x: x["messages"] or x["cases"],
         reverse=True,
     )[:15]
 
     top_load = top_merchants[0]["name"] if top_merchants else "—"
+
+    hourly = []
+    max_h = max(hours.values()) if hours else 1
+    for h in range(8, 21):
+        cnt = hours.get(h, 0)
+        bar = int(cnt / max_h * 20) if max_h else 0
+        hourly.append({
+            "hour": f"{h:02d}",
+            "count": cnt,
+            "bar": "█" * bar + "░" * (20 - bar),
+        })
 
     return {
         "label": label,
@@ -205,6 +244,7 @@ def build_report(start, end, label: str):
         "top_load": top_load,
         "emp_kpi": emp_kpi,
         "top_merchants": top_merchants,
+        "hourly": hourly,
         "now": datetime.now(TZ).strftime("%d.%m.%Y %H:%M"),
     }
 
@@ -224,33 +264,51 @@ def get_dashboard_data(filter_date: str | None = None):
     sla_ok = 0
     sla_total = 0
 
+    internal_cases_today = 0
+    internal_open_count = 0
+    merchant_cases_today = 0
+
     employee_stats = defaultdict(lambda: {
         "count": 0,
         "response_times": [],
         "sla_ok": 0,
         "sla_total": 0,
+        "helped_missed": 0,
+        "closed_total": 0,
     })
 
     recent_cases = []
-    open_cases = []
+    open_cases_merchant = []
+    open_cases_internal = []
 
     for case in cases:
         status = str(case.get("Status", "")).strip()
         case_date = str(case.get("Дата", "")).strip()
-        employee = str(case.get("Employee", "")).strip()
+        closed_by = str(case.get("Employee", "")).strip()
+        sla_owner = _sla_owner_of(case)
         response_time = case.get("Response Time", "")
         sla = str(case.get("SLA", "")).strip()
+        merchant = str(case.get("Merchant", "")).strip()
+        is_internal = _is_internal_merchant(merchant)
 
         if case_date == selected:
             total_today += 1
             if status == "Closed":
                 closed_today += 1
+            if is_internal:
+                internal_cases_today += 1
+            else:
+                merchant_cases_today += 1
 
         if status == "Open":
             open_count += 1
-            open_cases.append(case)
+            if is_internal:
+                internal_open_count += 1
+                open_cases_internal.append(case)
+            else:
+                open_cases_merchant.append(case)
 
-        if case_date == selected and response_time not in ("", None):
+        if case_date == selected and status == "Closed" and response_time not in ("", None):
             try:
                 rt = int(float(response_time))
                 response_times.append(rt)
@@ -260,17 +318,22 @@ def get_dashboard_data(filter_date: str | None = None):
             except Exception:
                 pass
 
-        if case_date == selected and employee:
-            employee_stats[employee]["count"] += 1
+        if case_date == selected and status == "Closed" and sla_owner:
+            employee_stats[sla_owner]["count"] += 1
             if response_time not in ("", None):
                 try:
                     rt = int(float(response_time))
-                    employee_stats[employee]["response_times"].append(rt)
-                    employee_stats[employee]["sla_total"] += 1
+                    employee_stats[sla_owner]["response_times"].append(rt)
+                    employee_stats[sla_owner]["sla_total"] += 1
                     if sla == "OK":
-                        employee_stats[employee]["sla_ok"] += 1
+                        employee_stats[sla_owner]["sla_ok"] += 1
                 except Exception:
                     pass
+
+        if case_date == selected and status == "Closed" and closed_by:
+            employee_stats[closed_by]["closed_total"] += 1
+            if sla_owner and closed_by != sla_owner and sla == "Missed":
+                employee_stats[closed_by]["helped_missed"] += 1
 
         recent_cases.append(case)
 
@@ -287,7 +350,7 @@ def get_dashboard_data(filter_date: str | None = None):
             continue
 
         messages_today += 1
-        if merchant:
+        if merchant and not _is_internal_merchant(merchant):
             merchant_messages[merchant] += 1
         try:
             hour = int(msg_time.split(":")[0])
@@ -300,13 +363,19 @@ def get_dashboard_data(filter_date: str | None = None):
 
     emp_kpi = []
     for name, stats in employee_stats.items():
-        avg = round(sum(stats["response_times"]) / len(stats["response_times"]), 1) if stats["response_times"] else 0
-        sla_p = round(stats["sla_ok"] / stats["sla_total"] * 100, 1) if stats["sla_total"] else 0
+        avg = round(
+            sum(stats["response_times"]) / len(stats["response_times"]), 1
+        ) if stats["response_times"] else 0
+        sla_p = round(
+            stats["sla_ok"] / stats["sla_total"] * 100, 1
+        ) if stats["sla_total"] else 0
         emp_kpi.append({
             "name": name,
             "count": stats["count"],
             "avg_response": avg,
             "sla": sla_p,
+            "helped_missed": stats["helped_missed"],
+            "closed_total": stats["closed_total"],
         })
     emp_kpi.sort(key=lambda x: x["count"], reverse=True)
 
@@ -321,10 +390,15 @@ def get_dashboard_data(filter_date: str | None = None):
     for h in range(8, 21):
         cnt = hours.get(h, 0)
         bar = int(cnt / max_h * 20) if max_h else 0
-        hourly.append({"hour": f"{h:02d}", "count": cnt, "bar": "█" * bar + "░" * (20 - bar)})
+        hourly.append({
+            "hour": f"{h:02d}",
+            "count": cnt,
+            "bar": "█" * bar + "░" * (20 - bar),
+        })
 
     recent_cases = list(reversed(recent_cases))[:15]
-    open_cases = list(reversed(open_cases))[:10]
+    open_cases_merchant = list(reversed(open_cases_merchant))[:10]
+    open_cases_internal = list(reversed(open_cases_internal))[:10]
     lunch_start, lunch_end = sheets.get_lunch()
 
     return {
@@ -338,7 +412,11 @@ def get_dashboard_data(filter_date: str | None = None):
         "top_merchants": top_merchants,
         "hourly": hourly,
         "recent_cases": recent_cases,
-        "open_cases": open_cases,
+        "open_cases": open_cases_merchant,
+        "open_cases_internal": open_cases_internal,
+        "internal_cases_today": internal_cases_today,
+        "internal_open_count": internal_open_count,
+        "merchant_cases_today": merchant_cases_today,
         "now": datetime.now(TZ).strftime("%d.%m.%Y %H:%M"),
         "selected_date": selected,
         "lunch_start": lunch_start,
@@ -354,11 +432,7 @@ async def login_page(request: Request, error: str | None = None):
         return RedirectResponse(url="/", status_code=303)
     return templates.TemplateResponse(
         "login.html",
-        {
-            "request": request,
-            "error": error,
-            "title": settings.dashboard_title,
-        },
+        {"request": request, "error": error, "title": settings.dashboard_title},
     )
 
 
@@ -376,24 +450,15 @@ async def login_submit(request: Request, password: str = Form(...)):
     if not role:
         return templates.TemplateResponse(
             "login.html",
-            {
-                "request": request,
-                "error": "Неверный пароль",
-                "title": settings.dashboard_title,
-            },
+            {"request": request, "error": "Неверный пароль", "title": settings.dashboard_title},
             status_code=401,
         )
 
     token = secrets.token_hex(16)
     _sessions[token] = role
-
     resp = RedirectResponse(url="/", status_code=303)
     resp.set_cookie(
-        key="mca_session",
-        value=token,
-        httponly=True,
-        samesite="lax",
-        max_age=60 * 60 * 12,
+        key="mca_session", value=token, httponly=True, samesite="lax", max_age=60 * 60 * 12
     )
     return resp
 
@@ -413,7 +478,6 @@ async def dashboard(request: Request, date: str | None = Query(None)):
     redirect = _require_login(request)
     if redirect:
         return redirect
-
     role = _get_role(request)
     data = get_dashboard_data(date)
     data["is_admin"] = role == "admin"
@@ -432,7 +496,6 @@ async def reports(
     redirect = _require_login(request)
     if redirect:
         return redirect
-
     start, end, label = get_period_bounds(period, date_from, date_to)
     data = build_report(start, end, label)
     data.update({
@@ -455,7 +518,6 @@ async def reports_excel(
     redirect = _require_login(request)
     if redirect:
         return redirect
-
     if Workbook is None:
         return HTMLResponse("Установите openpyxl: pip install openpyxl", status_code=500)
 
@@ -465,7 +527,6 @@ async def reports_excel(
     wb = Workbook()
     ws = wb.active
     ws.title = "Отчёт"
-
     header_font = Font(bold=True, size=14)
     bold = Font(bold=True)
 
@@ -473,7 +534,6 @@ async def reports_excel(
     ws["A1"].font = header_font
     ws["A2"] = f"Период: {label}"
     ws["A3"] = f"Сформирован: {data['now']}"
-
     ws["A5"] = "Показатель"
     ws["B5"] = "Значение"
     ws["A5"].font = bold
@@ -496,10 +556,11 @@ async def reports_excel(
     ws["A15"] = "KPI сотрудников"
     ws["A15"].font = bold
     ws["A16"] = "Сотрудник"
-    ws["B16"] = "Cases"
+    ws["B16"] = "Cases (SLA)"
     ws["C16"] = "Ср. ответ"
     ws["D16"] = "SLA %"
-    for col in ("A", "B", "C", "D"):
+    ws["E16"] = "Помог (просроч.)"
+    for col in ("A", "B", "C", "D", "E"):
         ws[f"{col}16"].font = bold
 
     r = 17
@@ -508,6 +569,21 @@ async def reports_excel(
         ws[f"B{r}"] = emp["count"]
         ws[f"C{r}"] = emp["avg_response"]
         ws[f"D{r}"] = emp["sla"]
+        ws[f"E{r}"] = emp.get("helped_missed", 0)
+        r += 1
+
+    r += 1
+    ws[f"A{r}"] = "Обращения по часам"
+    ws[f"A{r}"].font = bold
+    r += 1
+    ws[f"A{r}"] = "Час"
+    ws[f"B{r}"] = "Сообщений"
+    ws[f"A{r}"].font = bold
+    ws[f"B{r}"].font = bold
+    r += 1
+    for h in data["hourly"]:
+        ws[f"A{r}"] = h["hour"]
+        ws[f"B{r}"] = h["count"]
         r += 1
 
     r += 1
@@ -531,11 +607,11 @@ async def reports_excel(
     ws.column_dimensions["B"].width = 16
     ws.column_dimensions["C"].width = 14
     ws.column_dimensions["D"].width = 12
+    ws.column_dimensions["E"].width = 16
 
     buffer = BytesIO()
     wb.save(buffer)
     buffer.seek(0)
-
     filename = f"MerchantCare_Report_{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}.xlsx"
     return StreamingResponse(
         buffer,
@@ -549,8 +625,7 @@ async def lunch_start(request: Request):
     if _get_role(request) != "admin":
         return RedirectResponse(url="/", status_code=303)
     sheets.connect()
-    now = datetime.now(TZ).strftime("%d.%m.%Y %H:%M:%S")
-    sheets.set_lunch_start(now)
+    sheets.set_lunch_start(datetime.now(TZ).strftime("%d.%m.%Y %H:%M:%S"))
     return RedirectResponse(url="/", status_code=303)
 
 
@@ -559,8 +634,7 @@ async def lunch_end(request: Request):
     if _get_role(request) != "admin":
         return RedirectResponse(url="/", status_code=303)
     sheets.connect()
-    now = datetime.now(TZ).strftime("%d.%m.%Y %H:%M:%S")
-    sheets.set_lunch_end(now)
+    sheets.set_lunch_end(datetime.now(TZ).strftime("%d.%m.%Y %H:%M:%S"))
     return RedirectResponse(url="/", status_code=303)
 
 

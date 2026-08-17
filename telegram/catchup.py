@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+import asyncio
 from loguru import logger
 from sheets.client import sheets
 
@@ -29,7 +30,6 @@ class CatchUp:
             return today
 
     def get_oldest_open_case_time(self) -> datetime | None:
-        """Время самого старого открытого Case"""
         cases = sheets.get_all_cases()
         oldest = None
 
@@ -47,6 +47,25 @@ class CatchUp:
                 continue
 
         return oldest
+
+    def case_already_exists(self, group_name: str, track: str, msg_dt: datetime) -> bool:
+        if not track:
+            return False
+
+        cases = sheets.get_all_cases()
+        date_str = msg_dt.strftime("%d.%m.%Y")
+        time_prefix = msg_dt.strftime("%H:%M")
+
+        for case in cases:
+            if str(case.get("Group", "")).strip() != group_name:
+                continue
+            if str(case.get("Track", "")).strip() != track:
+                continue
+            if str(case.get("Дата", "")).strip() != date_str:
+                continue
+            if str(case.get("Время", "")).strip().startswith(time_prefix):
+                return True
+        return False
 
     async def build_dialogs_map(self):
         dialogs_map = {}
@@ -67,22 +86,22 @@ class CatchUp:
         return None
 
     async def close_open_cases_from_history(self, dialogs_map):
-        """
-        Для каждого Open Case ищем в истории первый ответ сотрудника
-        и закрываем Case (в т.ч. ответы с @Merchant_Care_Fargo).
-        """
-        logger.info("=== Закрытие вчерашних Open Cases по истории ===")
+        logger.info("=== Закрытие Open Cases по истории ===")
 
         cases = sheets.get_all_cases()
         closed_count = 0
+        open_list = [
+            case for case in cases
+            if str(case.get("Status", "")).strip() == "Open"
+        ]
 
-        for i, case in enumerate(cases):
-            if str(case.get("Status", "")).strip() != "Open":
-                continue
+        logger.info(f"Открытых Cases: {len(open_list)}")
 
+        for case in open_list:
             group_name = str(case.get("Group", "")).strip()
             case_date = str(case.get("Дата", "")).strip()
             case_time = str(case.get("Время", "")).strip()
+            case_id = str(case.get("Case ID", "")).strip()
 
             if not group_name:
                 continue
@@ -92,19 +111,26 @@ class CatchUp:
                     f"{case_date} {case_time}", "%d.%m.%Y %H:%M:%S"
                 ).replace(tzinfo=self.tz)
             except Exception:
+                logger.warning(f"Не удалось разобрать дату Case {case_id}")
                 continue
 
             dialog = self.find_dialog(dialogs_map, group_name)
             if not dialog:
-                logger.warning(f"Группа не найдена для Open Case: {group_name}")
+                logger.warning(f"Группа не найдена: {group_name}")
                 continue
 
-            try:
-                # Ищем первый ответ сотрудника после создания Case
-                async for msg in self.client.iter_messages(dialog.entity, reverse=True):
-                    msg_dt = msg.date.astimezone(self.tz)
+            logger.info(f"Ищем ответ для {case_id} | {group_name}")
 
-                    if msg_dt < case_dt:
+            try:
+                found = False
+                async for msg in self.client.iter_messages(
+                    dialog.entity,
+                    offset_date=case_dt,
+                    reverse=True,
+                    limit=50,
+                ):
+                    msg_dt = msg.date.astimezone(self.tz)
+                    if msg_dt <= case_dt:
                         continue
 
                     if not msg.sender_id:
@@ -114,7 +140,6 @@ class CatchUp:
                     if not self.handler.is_employee(sender):
                         continue
 
-                    # Нашли ответ сотрудника → закрываем через общую логику
                     merchant = str(case.get("Merchant", "")).strip() or group_name
                     await self.handler.process_employee_reply(
                         merchant=merchant,
@@ -124,21 +149,53 @@ class CatchUp:
                         sender=sender,
                     )
                     closed_count += 1
-                    break  # только первый ответ
+                    found = True
+                    await asyncio.sleep(2)
+                    break
+
+                if not found:
+                    logger.info(f"Ответа сотрудника не найдено: {case_id}")
 
             except Exception as e:
-                logger.error(f"Ошибка закрытия Case в {group_name}: {e}")
+                logger.error(f"Ошибка закрытия {case_id} в {group_name}: {e}")
+                await asyncio.sleep(3)
 
         logger.success(f"Закрыто Open Cases по истории: {closed_count}")
         return closed_count
 
+    async def find_employee_reply_after(self, dialog, after_dt: datetime):
+        try:
+            async for msg in self.client.iter_messages(
+                dialog.entity,
+                offset_date=after_dt,
+                reverse=True,
+                limit=40,
+            ):
+                msg_dt = msg.date.astimezone(self.tz)
+                if msg_dt <= after_dt:
+                    continue
+
+                if not msg.sender_id:
+                    continue
+
+                sender = await msg.get_sender()
+                if self.handler.is_employee(sender):
+                    return msg, sender
+        except Exception as e:
+            logger.error(f"Ошибка поиска ответа сотрудника: {e}")
+
+        return None, None
+
     async def load_new_merchant_messages(self, dialogs_map, since: datetime):
-        """Догрузка новых сообщений мерчантов → Messages + Cases"""
-        logger.info("=== Догрузка сообщений мерчантов ===")
+        """
+        Догрузка Cases с учётом режима группы (normal / mention).
+        """
+        logger.info("=== Догрузка Cases (с учётом mention) ===")
 
         groups_data = sheets.get_groups()
         total_cases = 0
-        total_messages = 0
+        total_closed = 0
+        skipped_mention = 0
         processed_groups = 0
 
         for g in groups_data:
@@ -147,6 +204,10 @@ class CatchUp:
 
             if not group_name or not merchant:
                 continue
+
+            mode = str(g.get("Режим", "") or g.get("Mode", "")).strip().lower()
+            if mode not in ("mention", "normal"):
+                mode = "normal"
 
             dialog = self.find_dialog(dialogs_map, group_name)
             if not dialog:
@@ -159,6 +220,7 @@ class CatchUp:
                     dialog.entity,
                     offset_date=since,
                     reverse=True,
+                    limit=30,
                 ):
                     msg_dt = msg.date.astimezone(self.tz)
                     if msg_dt < since:
@@ -171,12 +233,21 @@ class CatchUp:
                     if self.handler.is_employee(sender):
                         continue
 
-                    # Нагрузка — все сообщения мерчантов
-                    await self.handler.log_merchant_message(merchant, group_name, msg.date)
-                    total_messages += 1
-
-                    # Case — только с треком/телефоном
                     if not self.handler.is_valid_request(msg.text or ""):
+                        continue
+
+                    # Режим mention: только с @ MC
+                    if mode == "mention":
+                        if not self.handler.has_mc_mention(msg.text or ""):
+                            skipped_mention += 1
+                            continue
+
+                    track = self.handler.extract_track(msg.text or "")
+                    phone = self.handler.extract_phone(msg.text or "")
+                    track_value = track if track else phone
+
+                    if self.case_already_exists(group_name, track_value, msg_dt):
+                        logger.info(f"Пропуск дубликата: {track_value} | {group_name}")
                         continue
 
                     await self.handler.create_case(
@@ -187,13 +258,33 @@ class CatchUp:
                         sender=sender,
                     )
                     total_cases += 1
+                    await asyncio.sleep(2)
+
+                    reply_msg, reply_sender = await self.find_employee_reply_after(
+                        dialog, msg_dt
+                    )
+                    if reply_msg and reply_sender:
+                        await self.handler.process_employee_reply(
+                            merchant=merchant,
+                            group_name=group_name,
+                            text=reply_msg.text or "",
+                            msg_date=reply_msg.date,
+                            sender=reply_sender,
+                        )
+                        total_closed += 1
+                        logger.info(
+                            f"Case сразу закрыт (ответ уже был) | {track_value}"
+                        )
+                        await asyncio.sleep(2)
 
             except Exception as e:
                 logger.error(f"Ошибка догрузки {group_name}: {e}")
+                await asyncio.sleep(3)
 
         logger.success(
-            f"Догрузка мерчантов: групп {processed_groups} | "
-            f"Messages {total_messages} | Cases {total_cases}"
+            f"Догрузка: групп {processed_groups} | "
+            f"Cases {total_cases} | Сразу закрыто {total_closed} | "
+            f"Пропуск mention без @: {skipped_mention}"
         )
         return total_cases
 
@@ -203,14 +294,14 @@ class CatchUp:
         last_time = self.get_last_case_time()
         oldest_open = self.get_oldest_open_case_time()
 
-        # Берём запас: с самого старого Open Case или с последнего Case
         since = last_time - timedelta(minutes=2)
         if oldest_open and oldest_open < since:
             since = oldest_open - timedelta(minutes=1)
-            logger.info(f"Есть Open Cases с {oldest_open.strftime('%d.%m.%Y %H:%M')} — расширяем догрузку")
+            logger.info(
+                f"Есть Open Cases с {oldest_open.strftime('%d.%m.%Y %H:%M')} — расширяем догрузку"
+            )
 
-        # Не глубже 3 суток (защита от очень долгой загрузки)
-        min_since = datetime.now(self.tz) - timedelta(days=3)
+        min_since = datetime.now(self.tz) - timedelta(days=1)
         if since < min_since:
             since = min_since
 
@@ -221,10 +312,9 @@ class CatchUp:
         dialogs_map = await self.build_dialogs_map()
         logger.info(f"Загружено диалогов: {len(dialogs_map)}")
 
-        # 1. Сначала закрываем старые Open по ответам сотрудников
-        await self.close_open_cases_from_history(dialogs_map)
+        logger.info("Пропуск закрытия старых Open (экономия квоты)")
+        # await self.close_open_cases_from_history(dialogs_map)
 
-        # 2. Потом догружаем новые сообщения мерчантов
         await self.load_new_merchant_messages(dialogs_map, since)
 
         logger.success("Догрузка полностью завершена")
